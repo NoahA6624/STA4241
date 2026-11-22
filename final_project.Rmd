@@ -1,29 +1,672 @@
 ---
-title: "final_project"
-output: pdf_document
-date: "2026-11-20"
+title: "Clustering Beyond K-means"
+subtitle: "Gaussian mixtures, DBSCAN, and spectral clustering"
+author: "Noah Adelson and Wonchae Lee"
+date: "STA4241 · Fall 2026"
+fontsize: 11pt
+header-includes:
+  - \usepackage{float}
+  - \usepackage{booktabs}
+  - |
+    \makeatletter
+    \@ifclassloaded{beamer}{
+      \definecolor{Ink}{HTML}{173342}
+      \definecolor{Teal}{HTML}{007C83}
+      \setbeamercolor{normal text}{fg=Ink,bg=white}
+      \setbeamercolor{structure}{fg=Teal}
+      \setbeamercolor{frametitle}{fg=Ink,bg=white}
+      \setbeamerfont{title}{size=\LARGE,series=\bfseries}
+      \setbeamerfont{frametitle}{size=\large,series=\bfseries}
+      \setbeamertemplate{itemize items}[circle]
+      \setbeamertemplate{navigation symbols}{}
+      \setbeamertemplate{footline}[frame number]
+    }{
+      \geometry{margin=0.68in}
+      \AtBeginDocument{\setlength{\parskip}{3pt}\setlength{\intextsep}{7pt}}
+      \renewcommand{\maketitle}{\begingroup\centering
+        {\LARGE\bfseries \@title\par}\vspace{4pt}
+        {\normalsize \@author\quad\textbar\quad\@date\par}
+        \endgroup\vspace{7pt}}
+      \renewcommand{\subsection}{\@startsection{subsection}{2}{0pt}
+        {-2.2ex plus -.5ex minus -.2ex}{.8ex plus .2ex}{\normalfont\large\bfseries}}
+      \renewcommand{\subsubsection}{\@startsection{subsubsection}{3}{0pt}
+        {-1.8ex plus -.5ex minus -.2ex}{.65ex plus .2ex}{\normalfont\normalsize\bfseries}}
+    }
+    \makeatother
+params:
+  slides: false
+output:
+  pdf_document:
+    keep_tex: false
+  beamer_presentation:
+    theme: Boadilla
+    slide_level: 2
+    pandoc_args: ["-V", "aspectratio=169"]
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+# install.packages(c("rmarkdown", "ggplot2", "mclust", "dbscan", "RSpectra"))
+# Knit the report with rmarkdown::render("final_project.Rmd").
+# For slides, use a LaTeX installation with Beamer and run:
+# rmarkdown::render("final_project.Rmd", "beamer_presentation",
+#                   output_file = "final_project_slides.pdf",
+#                   params = list(slides = TRUE))
+library(ggplot2)
+library(mclust)
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, fig.align = "center",
+                      dev = "cairo_pdf", fig.pos = "H")
+theme_set(theme_minimal(base_size = 10) +
+            theme(panel.grid.minor = element_blank(),
+                  strip.text = element_text(face = "bold"),
+                  plot.margin = margin(5, 7, 5, 5)))
+methods <- c("K-means", "Gaussian mixture", "DBSCAN", "Spectral")
+candidate_k <- 2:8
+cluster_colors <- c("0" = "#858993", "1" = "#007C83", "2" = "#BC4B2E",
+                    "3" = "#6556A7", "4" = "#AC7420", "5" = "#2681B7",
+                    "6" = "#C7558A", "7" = "#527536", "8" = "#5B4444")
+fmt <- function(x, digits = 3) formatC(x, digits = digits, format = "f")
+fmt_ari <- function(x) fmt(round(x, 3) + 0)
+
+mean_silhouette <- function(labels, distances) {
+  k <- length(unique(labels))
+  if (k < 2L || k >= length(labels)) return(NA_real_)
+  mean(cluster::silhouette(as.integer(labels), distances)[, "sil_width"])
+}
+
+fit_kmeans <- function(x, distances) {
+  candidates <- lapply(candidate_k, function(k) {
+    kmeans(x, centers = k, nstart = 25, iter.max = 100)$cluster
+  })
+  scores <- vapply(candidates, mean_silhouette, numeric(1), distances = distances)
+  candidates[[which.max(scores)]]
+}
+
+fit_dbscan <- function(x, radius_quantile = 0.85) {
+  min_points <- 2L * ncol(x)
+  neighbor_distance <- dbscan::kNNdist(x, k = min_points - 1L)
+  radius <- unname(quantile(neighbor_distance, radius_quantile))
+  list(labels = dbscan::dbscan(x, eps = radius, minPts = min_points)$cluster,
+       radius = radius)
+}
+
+fit_spectral <- function(x, neighbors = 15L, k = NULL) {
+  n <- nrow(x)
+  nn <- dbscan::kNN(x, k = neighbors)
+  from <- rep(seq_len(n), each = neighbors)
+  to <- as.vector(t(nn$id))
+  edges <- cbind(pmin(from, to), pmax(from, to))
+  unique_edge <- !duplicated(edges)
+  bandwidth <- median(nn$dist[, neighbors])
+  weights <- exp(-0.5 * (as.vector(t(nn$dist))[unique_edge] / bandwidth)^2)
+  adjacency <- Matrix::sparseMatrix(i = edges[unique_edge, 1],
+                                    j = edges[unique_edge, 2],
+                                    x = weights, dims = c(n, n), symmetric = TRUE)
+  degree_root <- Matrix::Diagonal(x = 1 / sqrt(Matrix::rowSums(adjacency)))
+  normalized <- degree_root %*% adjacency %*% degree_root
+  # The full decomposition preserves repeated eigenvalues in the small graphs.
+  eigenpairs <- if (n <= 500L) {
+    eigen(as.matrix(normalized), symmetric = TRUE)
+  } else {
+    result <- RSpectra::eigs_sym(normalized, k = max(candidate_k) + 1L,
+                                 which = "LA")
+    stopifnot(result$nconv == max(candidate_k) + 1L)
+    result
+  }
+  # The largest normalized-adjacency eigenvalues correspond to the
+  # smallest normalized-Laplacian eigenvalues.
+  if (is.null(k)) {
+    gaps <- -diff(eigenpairs$values)
+    k <- candidate_k[which.max(gaps[candidate_k])]
+  }
+  embedding <- eigenpairs$vectors[, seq_len(k), drop = FALSE]
+  embedding <- embedding / sqrt(rowSums(embedding^2))
+  kmeans(embedding, centers = k, nstart = 25, iter.max = 100)$cluster
+}
+
+fit_methods <- function(x, distances) {
+  mixture <- Mclust(x, G = 1:8,
+                    modelNames = c("EII", "VII", "EEI", "VVI", "EEE", "VVV"),
+                    verbose = FALSE)
+  density <- fit_dbscan(x)
+  labels <- list(fit_kmeans(x, distances), mixture$classification,
+                 density$labels, fit_spectral(x))
+  list(labels = setNames(labels, methods), mixture = mixture, radius = density$radius)
+}
+
+score_partition <- function(labels, distances, truth, eligible = !is.na(truth)) {
+  assigned <- labels != 0L
+  # Subset the original distance matrix so DBSCAN noise does not enter a(i) or b(i).
+  silhouette <- if (all(assigned)) {
+    mean_silhouette(labels, distances)
+  } else if (sum(assigned) >= 3L) {
+    mean_silhouette(labels[assigned],
+                    as.dist(as.matrix(distances)[assigned, assigned, drop = FALSE]))
+  } else {
+    NA_real_
+  }
+  data.frame(groups = length(unique(labels[assigned])),
+             coverage = mean(assigned),
+             ari = adjustedRandIndex(truth[eligible], labels[eligible]),
+             silhouette = silhouette)
+}
 ```
 
-## R Markdown
+```{r simulation, include=FALSE}
+scenarios <- c("Overlapping ellipses", "Interleaving moons", "Blobs with noise")
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+simulate <- function(scenario) {
+  if (scenario == scenarios[1]) {
+    a <- matrix(rnorm(300), ncol = 2) %*% rbind(c(0.95, 0.85), c(0, 0.35))
+    b <- matrix(rnorm(300), ncol = 2) %*% rbind(c(0.90, -0.65), c(0, 0.40))
+    x <- rbind(sweep(a, 2, c(-1.15, 0), "+"), sweep(b, 2, c(1.15, 0), "+"))
+    truth <- rep(1:2, each = 150)
+  } else if (scenario == scenarios[2]) {
+    angle <- runif(300, 0, pi)
+    x <- rbind(cbind(cos(angle[1:150]), sin(angle[1:150])),
+               cbind(1 - cos(angle[151:300]), 0.5 - sin(angle[151:300]))) +
+      matrix(rnorm(600, sd = 0.055), ncol = 2)
+    truth <- rep(1:2, each = 150)
+  } else {
+    centers <- rbind(c(-3, -1.5), c(3, -1.5), c(0, 2.8))
+    inliers <- lapply(seq_len(3), function(j) {
+      sweep(matrix(rnorm(180, sd = c(0.32, 0.48, 0.68)[j]), ncol = 2),
+            2, centers[j, ], "+")
+    })
+    noise <- cbind(runif(30, -5.5, 5.5), runif(30, -4, 5))
+    x <- rbind(do.call(rbind, inliers), noise)
+    truth <- c(rep(1:3, each = 90), rep(0L, 30))
+  }
+  list(x = x, truth = truth)
+}
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+run_simulation <- function(scenario, seed) {
+  set.seed(seed)
+  sim <- simulate(scenario)
+  scaled <- scale(sim$x)
+  distances <- dist(scaled)
+  fit <- fit_methods(scaled, distances)
+  scores <- do.call(rbind, lapply(fit$labels, function(labels) {
+    score_partition(labels, distances, sim$truth)
+  }))
+  scores$inlier_ari <- vapply(fit$labels, function(labels) {
+    inliers <- sim$truth != 0L
+    adjustedRandIndex(sim$truth[inliers], labels[inliers])
+  }, numeric(1))
+  scores$noise_recall <- if (any(sim$truth == 0L)) {
+    vapply(fit$labels, function(labels) mean(labels[sim$truth == 0L] == 0L), numeric(1))
+  } else {
+    NA_real_
+  }
+  scores$method <- methods
+  scores$scenario <- scenario
+  list(data = sim, fit = fit, scores = scores)
+}
 
-```{r cars}
-summary(cars)
+replicates <- 30L
+simulation <- lapply(seq_along(scenarios), function(j) {
+  lapply(seq_len(replicates), function(i) run_simulation(scenarios[j], 1000L * j + i))
+})
+sim_scores <- do.call(rbind, lapply(simulation, function(runs) {
+  do.call(rbind, lapply(runs, `[[`, "scores"))
+}))
+sim_cell <- function(scenario, method, metric = "ari") {
+  sim_scores[sim_scores$scenario == scenario & sim_scores$method == method, metric]
+}
+sim_mean <- function(scenario, method, metric = "ari") {
+  mean(sim_cell(scenario, method, metric), na.rm = TRUE)
+}
+sim_table <- data.frame(Method = methods, check.names = FALSE)
+for (scenario in scenarios) {
+  sim_table[[scenario]] <- vapply(methods, function(method) {
+    values <- sim_cell(scenario, method)
+    paste0(fmt(mean(values), 2), " (", fmt(sd(values), 2), ")")
+  }, character(1))
+}
+
+# This design-controlled comparison holds the target count at two for both
+# methods, so the difference comes from the representation.
+set.seed(4240)
+moon_comparison <- lapply(simulation[[2]], function(run) {
+  scaled <- scale(run$data$x)
+  list("K-means (K = 2)" = kmeans(scaled, 2L, nstart = 25, iter.max = 100)$cluster,
+       "Spectral (K = 2)" = fit_spectral(scaled, k = 2L))
+})
+moon_scores <- lapply(seq_along(moon_comparison), function(i) {
+  run <- simulation[[2]][[i]]
+  partitions <- moon_comparison[[i]]
+  distances <- dist(scale(run$data$x))
+  vapply(partitions, function(labels) {
+    c(ARI = adjustedRandIndex(run$data$truth, labels),
+      silhouette = mean_silhouette(labels, distances))
+  }, numeric(2))
+})
+moon_control <- Reduce(`+`, moon_scores) / replicates
 ```
 
-## Including Plots
+```{r spotify, include=FALSE}
+data_revision <- "0880eb1f0ce5cbf229bead72c4e17dd19cfd1eb3"
+spotify_url <- paste0("https://raw.githubusercontent.com/rfordatascience/tidytuesday/",
+                      data_revision, "/data/2020/2020-01-21/spotify_songs.csv")
+spotify_csv <- tempfile(fileext = ".csv")
+download.file(spotify_url, spotify_csv, mode = "wb", quiet = TRUE)
+spotify <- read.csv(spotify_csv, encoding = "UTF-8")
+unlink(spotify_csv)
 
-You can also embed plots, for example:
+features <- c("danceability", "energy", "loudness", "speechiness", "acousticness",
+              "instrumentalness", "liveness", "valence", "tempo", "duration_ms")
+valid <- !is.na(spotify$track_id) & nzchar(spotify$track_id) &
+  Reduce(`&`, lapply(spotify[features], is.finite))
+audio <- spotify[valid, c("track_id", features)]
+audio <- audio[!duplicated(audio$track_id), ]
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+set.seed(4241)
+sample_size <- 2500L
+tracks <- audio[sample.int(nrow(audio), sample_size), ]
+x <- scale(tracks[features])
+distances <- dist(x)
+spotify_fit <- fit_methods(x, distances)
+
+# Recover a reference label only after all four primary fits are complete.
+genre_rows <- with(spotify, !is.na(playlist_genre) & nzchar(playlist_genre))
+by_track <- with(spotify[genre_rows, ], split(playlist_genre, track_id))
+genre <- vapply(by_track[tracks$track_id], function(values) {
+  genres <- unique(values)
+  if (length(genres) == 1L) genres else NA_character_
+}, character(1))
+
+spotify_scores <- do.call(rbind, lapply(spotify_fit$labels, score_partition,
+                                       distances = distances, truth = genre))
+spotify_table <- data.frame(
+  Method = methods, Groups = spotify_scores$groups,
+  `Assigned (%)` = fmt(100 * spotify_scores$coverage, 1),
+  ARI = fmt_ari(spotify_scores$ari),
+  Silhouette = ifelse(is.na(spotify_scores$silhouette), "N/A", fmt(spotify_scores$silhouette)),
+  check.names = FALSE
+)
+row.names(spotify_table) <- NULL
+
+set.seed(4242)
+settings <- data.frame(
+  Method = rep(c("DBSCAN", "Spectral"), each = 3L),
+  Setting = c("75th percentile", "85th percentile", "95th percentile",
+              "10 neighbors", "15 neighbors", "25 neighbors")
+)
+sensitivity_labels <- list(fit_dbscan(x, 0.75)$labels, spotify_fit$labels$DBSCAN,
+                           fit_dbscan(x, 0.95)$labels, fit_spectral(x, 10L),
+                           spotify_fit$labels$Spectral, fit_spectral(x, 25L))
+sensitivity <- cbind(settings, do.call(rbind, lapply(sensitivity_labels, score_partition,
+                                                    distances = distances, truth = genre)))
+sensitivity_table <- data.frame(
+  settings, Groups = sensitivity$groups,
+  `Assigned (%)` = fmt(100 * sensitivity$coverage, 1),
+  ARI = fmt_ari(sensitivity$ari),
+  Silhouette = ifelse(is.na(sensitivity$silhouette), "N/A", fmt(sensitivity$silhouette)),
+  check.names = FALSE
+)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r figures, include=FALSE}
+simulation_points <- function(scenario_ids, partitions) {
+  do.call(rbind, lapply(scenario_ids, function(i) {
+    run <- simulation[[i]][[1]]
+    labels <- c(list(Truth = run$data$truth), run$fit$labels)
+    if (i == 2L) {
+      labels <- c(labels, moon_comparison[[1]])
+    }
+    do.call(rbind, lapply(partitions, function(partition) {
+      data.frame(x1 = run$data$x[, 1], x2 = run$data$x[, 2],
+                 cluster = factor(labels[[partition]]),
+                 scenario = factor(scenarios[i], levels = scenarios),
+                 partition = factor(partition, levels = partitions))
+    }))
+  }))
+}
+
+plot_simulation <- function(scenario_ids, partitions) {
+  points <- simulation_points(scenario_ids, partitions)
+  plot <- ggplot(points, aes(x1, x2, color = cluster)) +
+    geom_point(size = 0.54, alpha = 0.83) +
+    scale_color_manual(values = c(cluster_colors,
+                                  setNames(grDevices::hcl.colors(12, "Dark 3"), 9:20)),
+                       guide = "none") +
+    labs(x = NULL, y = NULL) +
+    theme(panel.grid.major = element_blank(),
+          panel.border = element_rect(color = "#D8DCE3", fill = NA),
+          panel.spacing = grid::unit(5, "pt"))
+  if (length(partitions) == 1L) {
+    return(plot + facet_wrap(vars(scenario), scales = "free"))
+  }
+  plot + facet_grid(scenario ~ partition, scales = "free_y") +
+    theme(axis.text = element_blank(), axis.ticks = element_blank())
+}
+
+plot_case <- function(scenario_id, partitions) {
+  plot_simulation(scenario_id, partitions) +
+    theme(strip.text.y = element_blank(), strip.text.x = element_text(size = 12))
+}
+
+pca <- prcomp(x)
+pc_percent <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+spotify_pcs <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], genre = genre)
+plot_genres <- function() {
+  ggplot(spotify_pcs[!is.na(spotify_pcs$genre), ], aes(PC1, PC2)) +
+    geom_point(color = "#007C83", size = 0.59, alpha = 0.29) +
+    facet_wrap(vars(genre), nrow = 2) +
+    labs(x = paste0("PC1 (", fmt(pc_percent[1], 1), "%)"),
+         y = paste0("PC2 (", fmt(pc_percent[2], 1), "%)"))
+}
+
+table_latex <- function(data, caption = NULL, digits = 3) {
+  knitr::kable(data, format = "latex", booktabs = TRUE, row.names = FALSE,
+               caption = caption, digits = digits, position = "H")
+}
+```
+
+````{r report, results="asis", eval=!params$slides}
+report_markdown <- r"---(
+## When cluster shape matters
+
+A scatterplot can show groups that are hard to describe with a center. Two crescents may wrap around one another. Two groups of customers may overlap while stretching in different directions. A few unusual observations may sit far from either group. In each case the data can have structure, but the definition of a *cluster* determines what the algorithm finds.
+
+We compare Gaussian mixtures, DBSCAN, and spectral clustering against k-means. The comparison asks two questions. First, which assumptions help recover known groups when the data contain overlap, curved shapes, or noise? Second, how closely do audio-only clusters correspond to Spotify playlist genres? We can answer the first question against known simulation labels. For Spotify, the labels describe playlist placement and serve as an external reference after fitting.
+
+```{r truth-plot, fig.width=7.15, fig.height=2.45, out.width="100%", fig.cap="The generating labels in the first run of each simulation. Gray points were generated as background noise."}
+plot_simulation(1:3, "Truth")
+```
+
+### Baseline and evaluation
+
+K-means fits \(K\) centers by minimizing the within-cluster sum of squares,
+\[
+  \min_{C_1,\ldots,C_K}\sum_{g=1}^K\sum_{i\in C_g}
+  \lVert x_i-\bar{x}_{C_g}\rVert_2^2.
+\]
+Given fitted centers, points go to their nearest center, dividing Euclidean space into convex regions. That geometry makes k-means a useful baseline for relatively compact groups and gives a prediction for when it will split a curve. We fit 25 random starts per \(K\) and choose \(K\) from 2 through 8 by maximizing the mean silhouette.
+
+We measure agreement with the **adjusted Rand index** (ARI). It compares pairs of observations by whether each partition puts them together and adjusts for the agreement expected by chance given the cluster sizes (Hubert and Arabie, 1985). A perfect match gives 1 even if the cluster IDs are swapped. Values near 0 indicate chance-level agreement under the adjustment model, and negative values are possible.
+
+The **silhouette** measures geometry without reference labels. For a point \(i\), let \(a(i)\) be the mean distance to the other points in its cluster and \(b(i)\) the smallest mean distance to another cluster. Its silhouette is \((b(i)-a(i))/\max\{a(i),b(i)\}\), with singleton silhouettes defined as zero. We average these values using the standardized input space (Rousseeuw, 1987). A high value favors compact, separated groups, which can give a misleading picture for curves.
+
+For DBSCAN, we count rejected points under a single noise label in the full ARI. We exclude them from the silhouette and report **coverage**, the fraction assigned to a cluster. A DBSCAN silhouette therefore describes the retained subset and can increase as coverage drops. The silhouette is undefined when fewer than two clusters are found.
+
+## Gaussian mixtures and expectation-maximization
+
+A Gaussian mixture treats each point \(x_i \in \mathbb{R}^p\) as a draw from one of \(G\) latent components. The mixing weight \(\pi_g\) is the probability of drawing component \(g\). That component has mean \(\mu_g\) and covariance \(\Sigma_g\), which controls its size, shape, and orientation. With \(\pi_g>0\) and \(\sum_g\pi_g=1\), the observed-data log-likelihood is
+\[
+  \ell(\theta)=\sum_{i=1}^n \log\!\left[
+    \sum_{g=1}^{G}\pi_g\,\phi_p(x_i;\mu_g,\Sigma_g)
+  \right],
+\]
+where \(\phi_p\) is the \(p\)-dimensional normal density and \(\theta\) collects the weights, means, and covariances. The difficulty is the sum inside each logarithm. If we knew the component indicators \(z_{ig}\), the complete-data log-likelihood would separate into terms \(z_{ig}[\log \pi_g+\log\phi_p(x_i;\mu_g,\Sigma_g)]\).
+
+### The EM updates
+
+The expectation-maximization algorithm alternates between estimating latent memberships and updating the component parameters (Dempster et al., 1977).
+
+**E step.** Using the current parameters and Bayes' rule, compute the posterior membership probabilities, also called responsibilities,
+\[
+  r_{ig} = \Pr(z_{ig}=1\mid x_i,\theta)
+         = \frac{\pi_g\phi_p(x_i;\mu_g,\Sigma_g)}
+                 {\sum_{h=1}^{G}\pi_h\phi_p(x_i;\mu_h,\Sigma_h)}.
+\]
+For example, if two components contribute weighted densities of 0.36 and 0.12 at a point, its responsibilities are 0.75 and 0.25. A hard label assigns it to the first group. The soft assignment preserves the ambiguity where the components overlap.
+
+**M step.** Replace the unknown indicators in the complete-data log-likelihood with \(r_{ig}\) and maximize the resulting weighted objective. For separate, unrestricted covariances, write \(N_g=\sum_i r_{ig}\). The updates are
+\[
+  \pi_g^{\rm new}=\frac{N_g}{n},\qquad
+  \mu_g^{\rm new}=\frac{\sum_i r_{ig}x_i}{N_g},\qquad
+  \Sigma_g^{\rm new}
+    =\frac{\sum_i r_{ig}(x_i-\mu_g^{\rm new})(x_i-\mu_g^{\rm new})^\top}{N_g}.
+\]
+With shared or structured covariances, the maximization respects those restrictions. EM increases or maintains the observed likelihood at each iteration when its steps are solved exactly. Initialization matters because the likelihood can have local optima. A fitted covariance can also become nearly singular when a component collapses onto a small set of points.
+
+### Selecting the component count
+
+We fit mixtures with \(G=1,\ldots,8\) using \texttt{mclust} (Scrucca et al., 2016). The six candidate covariance families are spherical, diagonal, and full, each with either shared or component-specific covariance (EII, VII, EEI, VVI, EEE, VVV). We take the fitted model with the highest
+\[
+  \mathrm{BIC}=2\ell(\widehat\theta)-q\log n ,
+\]
+where \(q\) counts the free parameters. Under separate full covariances,
+\(q=(G-1)+Gp+Gp(p+1)/2\), so additional components and dimensions can quickly raise the penalty. The BIC counts components in a density model. A curved group can be approximated by several Gaussians and receive several fitted labels even when it forms one connected group. For ARI and silhouette we assign each point to its most probable component and retain the probabilities to examine uncertainty.
+
+## Clustering by density and connectivity
+
+### DBSCAN
+
+DBSCAN uses two parameters, a radius \(\varepsilon\) and a minimum count \(m\) (Ester et al., 1996). The neighborhood \(N_\varepsilon(x)=\{y:\lVert y-x\rVert_2\le\varepsilon\}\) includes \(x\) itself. A **core** point has \(|N_\varepsilon(x)|\ge m\). A non-core point within range of a core is a **border** point. A point that is neither core nor border is labeled **noise**.
+
+A point \(y\) is directly density-reachable from a core \(x\) when \(y\in N_\varepsilon(x)\). Density reachability extends this rule along a chain of such steps. Because each step must start at a core point, a border point may end a chain but cannot carry it farther. Two points are density-connected when both are reachable from a common point. In practice, connected components of the core-point graph give the cluster cores, and the algorithm attaches adjacent border points. A border point next to cores from two components can be assigned according to traversal order.
+
+On the moons, two points may be farther apart than \(\varepsilon\) and still be in the same cluster because intermediate core points trace the arc. A gap within an arc can break that chain. Enlarging \(\varepsilon\) can reconnect the arc but can also link separate arcs via a dense bridge. A single global radius is consequently difficult to choose when groups have different densities.
+
+We set \(m=2p\), where \(p\) is the feature dimension. Our main \(\varepsilon\) is the 85th percentile of the distance to the \((m-1)\)th other observation, following the idea of using nearest-neighbor distances to characterize local density. The 85th percentile is our reproducible heuristic. Since border points can also be assigned, it does not fix the noise rate at 15%. We vary the percentile on Spotify to see how sensitive the solution is.
+
+### Spectral clustering
+
+Spectral clustering groups points through a graph of local similarities (Ng et al., 2001). We join observations \(i,j\) if either point is among the other's \(h=15\) nearest neighbors. For a connected pair the weight is
+\[
+ W_{ij}=\exp\!\left(-\frac{\lVert x_i-x_j\rVert_2^2}{2\sigma^2}\right),
+ \quad D_{ii}=\sum_j W_{ij}, \quad L_{\rm sym}=I-D^{-1/2}WD^{-1/2}.
+\]
+The diagonal of \(W\) is zero. Here \(\sigma\) is the median distance to the \(h\)th neighbor, \(D\) is the diagonal degree matrix, and \(L_{\rm sym}\) is the normalized graph Laplacian. For any vector \(f\),
+\[
+  f^\top L_{\rm sym} f =
+  \tfrac12\sum_{i,j}W_{ij}
+  \left(\frac{f_i}{\sqrt{D_{ii}}}-\frac{f_j}{\sqrt{D_{jj}}}\right)^2.
+\]
+The smallest eigenvectors therefore describe directions in which values change slowly along strong edges. If the graph consists of disconnected components, each gives one zero eigenvalue, with an eigenvector proportional to \(\sqrt{D_{ii}}\) on that component and zero elsewhere. Nearly disconnected groups can yield small eigenvalues and comparable patterns.
+
+We order the eigenvalues and choose \(K\in\{2,\ldots,8\}\) by the largest gap \(\lambda_{K+1}-\lambda_K\). We use the first \(K\) eigenvectors as columns of an \(n\times K\) matrix, normalize each observation's row to length one, and apply k-means with 25 starts to those rows. This final step can separate groups that were intertwined in the original coordinates. The number of neighbors controls which gaps and connections appear in the graph. We compare 10, 15, and 25 neighbors on Spotify.
+
+## Simulation study
+
+We generated 30 independent data sets per scenario, each with 300 observations and two features. The first scenario used two bivariate normals with different covariance orientations, giving partially overlapping ellipses. The second used two interleaving semicircles with Gaussian jitter. The third used three separated Gaussian blobs with different spreads and added 30 uniform background points, some of which landed inside the blobs. We z-scored the two coordinates within each data set. All methods received the same observations. The generating labels entered only the evaluation.
+
+```{r simulation-table, results="asis"}
+table_latex(sim_table, "Mean ARI (standard deviation) across 30 runs per scenario.")
+```
+
+### Recovery depends on shape
+
+On the overlapping ellipses, the Gaussian mixture had a mean ARI of `r fmt(sim_mean(scenarios[1], methods[2]), 2)` and k-means had `r fmt(sim_mean(scenarios[1], methods[1]), 2)`. The two true distributions place probability mass in some of the same regions, so even a correctly specified mixture can make mistakes when forced to produce a hard label. DBSCAN's density threshold can merge overlapping regions if a chain of core points passes between them.
+
+```{r moons-fits, fig.width=7.15, fig.height=1.80, out.width="100%", fig.cap="First run of the moons simulation. Colors identify groups separately in each panel. Gray denotes DBSCAN noise."}
+plot_case(2, c("Truth", methods))
+```
+
+The main settings split the moons into pieces. K-means cut across the arcs, the mixture approximated their curvature with several ellipses, and DBSCAN left breaks within the arcs. The largest spectral eigengap can separate smaller graph segments. We reran spectral clustering and k-means with \(K=2\) on all 30 moons data sets, using the known count only for this comparison. The mean ARIs were `r fmt(moon_control["ARI", 2], 2)` for spectral and `r fmt(moon_control["ARI", 1], 2)` for k-means. The mean silhouettes were `r fmt(moon_control["silhouette", 2], 2)` and `r fmt(moon_control["silhouette", 1], 2)`, respectively. The silhouette can prefer compact pieces to intact moons because same-moon points far along the arc increase the within-cluster distance.
+
+### Background points change the evaluation
+
+For the noisy blobs, DBSCAN assigned `r fmt(100 * sim_mean(scenarios[3], "DBSCAN", "coverage"), 1)`% of all points and identified `r fmt(100 * sim_mean(scenarios[3], "DBSCAN", "noise_recall"), 1)`% of the uniform background points as noise on average. Its inlier-only ARI was `r fmt(sim_mean(scenarios[3], "DBSCAN", "inlier_ari"), 2)`, versus `r fmt(sim_mean(scenarios[3], "K-means", "inlier_ari"), 2)` for k-means. The other three methods assigned every point by design. The full ARI asks them to match the noise label as well as the three blobs, while the inlier-only score isolates agreement among the Gaussian observations. A uniform draw that falls within a dense blob is difficult to identify by position alone.
+
+## Spotify audio features
+
+We used the TidyTuesday Spotify songs release from January 21, 2020. Its `r format(nrow(spotify), big.mark = ",")` rows are playlist appearances, so the same track can occur several times. We required a track ID and finite values for all ten fitting variables, then kept one row per ID. The `r format(nrow(audio), big.mark = ",")` usable tracks formed the sampling frame. We drew `r format(sample_size, big.mark = ",")` tracks uniformly without replacement with a fixed seed. This kept the repeated distance calculations manageable and gave every method the same sample.
+
+The input features were danceability, energy, loudness, speechiness, acousticness, instrumentalness, liveness, valence, tempo, and duration. We centered and scaled each variable to unit sample variance. A unit in tempo or milliseconds then had the same marginal scale as a unit in the bounded audio scores. Key and mode were excluded because raw Euclidean distance is poorly suited to a circular pitch class and a binary category. Popularity, playlist fields, and artist fields were excluded to focus on the audio features.
+
+The standardized inputs still contain correlated information. For example, energy and loudness had a Pearson correlation of `r fmt(cor(x[, "energy"], x[, "loudness"]), 2)` in the sample. About `r fmt(100 * mean(tracks$instrumentalness == 0), 1)`% of sampled tracks had zero instrumentalness, so a normal component can be an imperfect description. The first two principal components together explained `r fmt(sum(pc_percent[1:2]), 1)`% of standardized variance. They are used below to visualize the data. All fits used the ten features.
+
+```{r genre-pca, fig.width=6.8, fig.height=2.55, out.width="93%", fig.cap="The same PCA coordinates faceted by playlist genre for tracks with a single genre. Axis scales are identical across panels."}
+plot_genres()
+```
+
+We recovered a genre for evaluation only when all playlist appearances with a recorded genre agreed for that track. This gave `r format(sum(!is.na(genre)), big.mark = ",")` evaluable tracks. The remaining `r sum(is.na(genre))` tracks participated in model fitting and silhouette calculations but were omitted from genre ARI. The broad overlap in Figure 3 gives a visual reason to expect weak agreement, although the two-dimensional projection discards some information.
+
+```{r spotify-results, results="asis"}
+table_latex(spotify_table, "Spotify results. Groups and coverage exclude DBSCAN noise. Genre ARI includes assigned and rejected tracks with a single genre.")
+```
+
+The mixture's BIC selected `r spotify_fit$mixture$G` components from the `r spotify_fit$mixture$modelName` covariance family. Its mean fitted uncertainty, \(1-\max_g r_{ig}\), was `r fmt(mean(spotify_fit$mixture$uncertainty))`. The largest observed genre ARI was `r fmt(max(spotify_scores$ari))` (`r methods[which.max(spotify_scores$ari)]`). All four partitions showed limited agreement with the playlist labels, including solutions that separated some tracks well in the standardized audio space.
+
+## Sensitivity and interpretation
+
+The Spotify comparison holds the sample and scaling fixed. For DBSCAN we change only the radius percentile (the main fit used \(\varepsilon=\) `r fmt(spotify_fit$radius)` and \(m=20\)). For spectral clustering we change the graph's neighbor count and recompute its bandwidth and eigengap. The settings below are a sensitivity check and were kept separate from the primary fits.
+
+```{r spotify-sensitivity, results="asis"}
+table_latex(sensitivity_table, "Sensitivity to density radius and graph size on the same Spotify sample.")
+```
+
+Increasing the DBSCAN radius raised coverage from `r fmt(100 * sensitivity$coverage[1], 1)`% to `r fmt(100 * sensitivity$coverage[3], 1)`%. Every tested radius still gave one cluster plus noise, so none yielded a silhouette. Spectral clustering returned two groups at all three neighbor counts, with similar silhouettes and genre ARIs. Within this range, expanding the neighborhood did little to improve agreement with playlists.
+
+These results describe the chosen Spotify sample and the audio representation. Playlists encode curation and cross-genre choices, and repeated appearances can disagree. The single-genre evaluation subset may omit crossover tracks disproportionately. Euclidean distances also give correlated features overlapping influence and can emphasize unusual values even after standardization. Alternative feature transformations, distance choices, or pinned samples could change the fitted partitions. Low ARI supports a limited claim about agreement with this reference under this protocol.
+
+The simulations give a more direct way to interpret the methods. Gaussian mixtures are useful when overlapping ellipses are plausible and probabilities convey useful uncertainty. DBSCAN provides an explicit noise label and can follow non-convex shapes, with the cost of choosing a density threshold that may work differently across regions. Spectral clustering can also follow curved geometry by changing the representation, but the graph and the selected cluster count matter. K-means remains an interpretable reference for compact groups. Its favorable silhouette on the moons illustrates why cluster quality needs a definition tied to the scientific question.
+
+### References
+
+Dempster, A. P., Laird, N. M., and Rubin, D. B. (1977). Maximum likelihood from incomplete data via the EM algorithm. *JRSS B, 39*, 1–38. [Article](https://doi.org/10.1111/j.2517-6161.1977.tb01600.x).
+
+Ester, M., Kriegel, H.-P., Sander, J., and Xu, X. (1996). A density-based algorithm for discovering clusters in large spatial databases with noise. *KDD*, 226–231. [Paper](https://cdn.aaai.org/KDD/1996/KDD96-037.pdf).
+
+Hubert, L., and Arabie, P. (1985). Comparing partitions. *Journal of Classification, 2*, 193–218. [Article](https://doi.org/10.1007/BF01908075).
+
+Ng, A. Y., Jordan, M. I., and Weiss, Y. (2001). On spectral clustering. *Advances in Neural Information Processing Systems 14*, 849–856. [Paper](https://papers.nips.cc/paper/2092-on-spectral-clustering-analysis-and-an-algorithm).
+
+Rousseeuw, P. J. (1987). Silhouettes. *Journal of Computational and Applied Mathematics, 20*, 53–65. [Article](https://doi.org/10.1016/0377-0427(87)90125-7).
+
+Scrucca, L., Fop, M., Murphy, T. B., and Raftery, A. E. (2016). mclust 5. *The R Journal, 8*(1), 289–317. [Article](https://journal.r-project.org/articles/RJ-2016-021/).
+
+TidyTuesday (2020, January 21). Spotify songs, collected with spotifyr for Kaylin Pavlik's genre analysis. [Data and dictionary](https://github.com/rfordatascience/tidytuesday/tree/0880eb1f0ce5cbf229bead72c4e17dd19cfd1eb3/data/2020/2020-01-21).
+)---"
+cat(knitr::knit_child(text = strsplit(report_markdown, "\n", fixed = TRUE)[[1]],
+                      envir = environment(), quiet = TRUE), sep = "\n")
+````
+
+````{r slides, results="asis", eval=params$slides}
+slides_markdown <- r"---(
+## What counts as a cluster?
+
+```{r slides-truth, fig.width=9.3, fig.height=2.5, out.width="100%"}
+plot_simulation(1:3, "Truth") + theme(text = element_text(size = 13))
+```
+
+K-means assigns each point to its nearest center. That works well for compact groups, but a straight boundary can split a curved group.
+
+Each simulated data set has known generating labels. Gray points on the right are uniform background draws.
+
+## A Gaussian mixture models overlapping groups
+
+\[
+  f(x)=\sum_{g=1}^{G}\pi_g\,\phi_p(x;\mu_g,\Sigma_g), \qquad \sum_g\pi_g=1
+\]
+
+- \(\pi_g\) gives the prevalence of component \(g\).
+- \(\mu_g\) locates its center. \(\Sigma_g\) controls spread and orientation.
+- \(\Pr(z_i=g\mid x_i)\) gives a soft assignment. An observation where the ellipses overlap can have substantial probability in both.
+
+## EM estimates the mixture and BIC selects a model
+
+**E step.** Normalize the weighted densities across components.
+\[
+  r_{ig}=\frac{\pi_g\phi_p(x_i;\mu_g,\Sigma_g)}
+              {\sum_h\pi_h\phi_p(x_i;\mu_h,\Sigma_h)}
+\]
+
+**M step.** Use the responsibilities as weights. For an unrestricted component,
+\[
+  N_g=\sum_i r_{ig},\quad \pi_g^{\rm new}=N_g/n,\quad
+  \mu_g^{\rm new}=\sum_i r_{ig}x_i/N_g.
+\]
+Update the covariance with the corresponding weighted deviations from the new mean.
+
+**Select.** Maximize \(2\ell(\widehat\theta)-q\log n\) over \(G=1,\ldots,8\) and six covariance families.
+
+## DBSCAN follows chains of dense neighborhoods
+
+- **Core.** At least \(m\) points, including itself, lie within \(\varepsilon\).
+- **Border.** A non-core point lies within \(\varepsilon\) of a core.
+- **Noise.** The point satisfies neither condition.
+
+A chain can trace a curved cluster. A border point can end the chain.
+
+We used \(m=2p\) and set \(\varepsilon\) to the 85th percentile of the distance to the \((m-1)\)th other point. A larger radius helps bridge gaps and can connect separate groups.
+
+## Spectral clustering uses a graph embedding
+
+Connect observations if either is among the other's 15 nearest neighbors. Nearby pairs get larger Gaussian weights.
+
+\[
+  D_{ii}=\sum_j W_{ij},\qquad
+  L_{\rm sym}=I-D^{-1/2}WD^{-1/2}
+\]
+
+1. Select \(K\) from 2 through 8 by the largest eligible Laplacian eigengap.
+2. Embed each point as a row of the first \(K\) eigenvectors.
+3. Normalize each row to length one and run k-means on the rows.
+
+Small eigenvalues track weak connections. A curved group can become compact in this embedding.
+
+## Simulation design and scoring
+
+**Design.** We generated 30 data sets per shape, with 300 observations each. Every method used the same z-scored coordinates.
+
+**Adjusted Rand index.** Compares the fitted and generating labels. One means perfect agreement and zero indicates agreement near the chance baseline.
+
+**Silhouette.** Compares each point's mean distance within its cluster with its mean distance to the closest other cluster. The plot and score can favor different shapes.
+
+We keep DBSCAN noise in ARI. We omit it from the silhouette and report coverage.
+
+## Shape and noise change which method succeeds
+
+```{r slides-sim-table, results="asis"}
+table_latex(sim_table)
+```
+
+Mean ARI (standard deviation) across 30 runs per scenario.
+
+- The mixture fit the overlapping ellipses best in this comparison.
+- DBSCAN identified `r fmt(100 * sim_mean(scenarios[3], "DBSCAN", "noise_recall"), 1)`% of the uniform background points as noise on average.
+- The primary settings struggled on the moons. Both the radius rule and the eigengap could split a single arc.
+
+## The spectral embedding separates the two moons
+
+```{r slides-moon-plot, fig.width=9.0, fig.height=2.05, out.width="100%"}
+plot_case(2, c("Truth", "K-means (K = 2)", "Spectral (K = 2)"))
+```
+
+With \(K=2\) fixed for both methods, mean ARI was **`r fmt(moon_control["ARI", 1], 2)`** for k-means and **`r fmt(moon_control["ARI", 2], 2)`** for spectral clustering.
+
+K-means had the higher mean silhouette in the input space (`r fmt(moon_control["silhouette", 1], 2)` versus `r fmt(moon_control["silhouette", 2], 2)`).
+
+## Spotify audio features and playlist genres
+
+```{r slides-pca, fig.width=9.0, fig.height=2.55, out.width="100%"}
+plot_genres() + theme(text = element_text(size = 13))
+```
+
+We sampled **`r format(sample_size, big.mark = ",")` tracks** and fit all methods on ten standardized audio features. The plots show a two-dimensional projection for the **`r format(sum(!is.na(genre)), big.mark = ",")`** tracks with a single playlist genre.
+
+## Audio clusters showed weak genre agreement
+
+```{r slides-spotify-table, results="asis"}
+table_latex(spotify_table)
+```
+
+The Gaussian mixture gave the highest genre ARI in this sample. Its fitted component assignments were usually confident, with mean posterior uncertainty of `r fmt(mean(spotify_fit$mixture$uncertainty))`.
+
+DBSCAN found one cluster plus noise. Its silhouette is undefined.
+
+## Sensitivity and takeaways
+
+- **Density.** DBSCAN coverage ranged from `r fmt(100 * min(sensitivity$coverage[1:3]), 1)`% to `r fmt(100 * max(sensitivity$coverage[1:3]), 1)`% across the three Spotify radii. Each radius gave one cluster plus noise.
+- **Graph.** Spectral clustering gave two groups at 10, 15, and 25 neighbors. Genre ARI rounded to `r fmt(sensitivity$ari[5])` for all three.
+- **Interpretation.** The method should match the kind of structure that matters. Playlist genres are a reference for comparison, while the input distance measures similarity in audio features.
+
+## References
+
+\small
+
+- Dempster, Laird, and Rubin (1977), [Maximum likelihood from incomplete data via the EM algorithm](https://doi.org/10.1111/j.2517-6161.1977.tb01600.x).
+- Ester et al. (1996), [A density-based algorithm for discovering clusters in large spatial databases with noise](https://cdn.aaai.org/KDD/1996/KDD96-037.pdf).
+- Hubert and Arabie (1985), [Comparing partitions](https://doi.org/10.1007/BF01908075).
+- Ng, Jordan, and Weiss (2001), [On spectral clustering](https://papers.nips.cc/paper/2092-on-spectral-clustering-analysis-and-an-algorithm).
+- Rousseeuw (1987), [Silhouettes](https://doi.org/10.1016/0377-0427(87)90125-7).
+- Scrucca et al. (2016), [mclust 5](https://journal.r-project.org/articles/RJ-2016-021/).
+- TidyTuesday (2020), [Spotify songs and data dictionary](https://github.com/rfordatascience/tidytuesday/tree/0880eb1f0ce5cbf229bead72c4e17dd19cfd1eb3/data/2020/2020-01-21).
+)---"
+cat(knitr::knit_child(text = strsplit(slides_markdown, "\n", fixed = TRUE)[[1]],
+                      envir = environment(), quiet = TRUE), sep = "\n")
+````
