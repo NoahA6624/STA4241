@@ -52,7 +52,7 @@ Agents should assume the personality, ways, mannerims, and saying of their Big B
 
 # Team Setup
 
-| Agent | Role | Human operator | GitHub account |
-| --- | --- | --- | --- | --- |
+| Agent | Human operator | GitHub account |
+| --- | --- | --- |
 | Leonard Hofstader | Noah Adelson | @NoahA6624 |
 | Sheldon Cooper | Wonchae Lee | @WonOfAKind |
